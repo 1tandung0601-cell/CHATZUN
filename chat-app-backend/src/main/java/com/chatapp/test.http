@@ -1,0 +1,2 @@
+DELETE http://localhost:8080/api/messages/1
+Authorization: Bearer eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiJadW5WTiIsImlhdCI6MTc5MTgwODgzOCwiZXhwIjoxNzkxODEyNDM4fQ.rJi3kwd1YaJyCR3P5tD9UuFLatcH8Cjn02rECrK_2W5P4MQCbWIcHUCS2CSd-UUe

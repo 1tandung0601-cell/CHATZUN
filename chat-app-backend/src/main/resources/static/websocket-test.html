@@ -1,0 +1,932 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chatapp - Realtime Test</title>
+
+    <!-- Thư viện STOMP để giao tiếp với Spring WebSocket -->
+    <script src="https://cdn.jsdelivr.net/npm/@stomp/stompjs@7/bundles/stomp.umd.min.js"></script>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 760px;
+            margin: 30px auto;
+            padding: 0 16px;
+            color: #222;
+        }
+
+        input, button {
+            box-sizing: border-box;
+            padding: 10px;
+            margin: 5px 0;
+            font-size: 14px;
+        }
+
+        input {
+            width: 100%;
+        }
+
+        button {
+            cursor: pointer;
+        }
+
+        button:disabled {
+            cursor: not-allowed;
+        }
+
+        .section {
+            border: 1px solid #ddd;
+            border-radius: 10px;
+            padding: 16px;
+            margin: 16px 0;
+        }
+
+        #status {
+            font-weight: bold;
+        }
+
+        #messages {
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 12px;
+            min-height: 220px;
+            max-height: 400px;
+            overflow-y: auto;
+            overflow-wrap: anywhere;
+        }
+
+        .message-line {
+            padding: 10px 0;
+            border-bottom: 1px solid #eee;
+        }
+
+        .message-content {
+            white-space: pre-wrap;
+        }
+
+        .message-meta {
+            color: #666;
+            font-size: 12px;
+            margin-top: 4px;
+        }
+
+        .message-actions button {
+            font-size: 12px;
+            padding: 5px 9px;
+            margin-right: 5px;
+        }
+
+        .hint {
+            color: #666;
+            font-size: 13px;
+        }
+
+        #historyStatus {
+            min-height: 18px;
+            margin: 5px 0;
+        }
+
+        .system-log {
+            color: #666;
+            font-size: 12px;
+            padding: 3px 0;
+        }
+    </style>
+</head>
+
+<body>
+<h2>Chatapp Realtime Test</h2>
+<p id="status">Chưa đăng nhập</p>
+
+<div class="section">
+    <h3>1. Đăng nhập</h3>
+
+    <label for="username">Username</label>
+    <input id="username" autocomplete="username"
+           placeholder="Nhập username">
+
+    <label for="password">Password</label>
+    <input id="password" type="password"
+           autocomplete="current-password"
+           placeholder="Nhập password">
+
+    <button id="connectButton">Đăng nhập và kết nối</button>
+    <button id="disconnectButton" disabled>Ngắt kết nối</button>
+
+    <p class="hint">
+        JWT chỉ được giữ trong bộ nhớ khi trang đang chạy.
+    </p>
+</div>
+
+<div class="section">
+    <h3>2. Chọn cuộc trò chuyện</h3>
+
+    <label for="conversationId">Conversation ID</label>
+    <input id="conversationId" type="number" min="1"
+           placeholder="Ví dụ: 3">
+
+    <button id="roomButton" disabled>Vào / đổi phòng</button>
+
+    <p class="hint">
+        Hai tài khoản phải là thành viên của cùng cuộc trò chuyện.
+    </p>
+</div>
+
+<div class="section">
+    <h3>3. Gửi tin nhắn</h3>
+
+    <input id="content" maxlength="5000"
+           placeholder="Nhập tin nhắn...">
+
+    <button id="sendButton" disabled>Gửi tin nhắn</button>
+
+    <h3>Tin nhắn</h3>
+    <p id="historyStatus" class="hint"></p>
+    <div id="messages"></div>
+
+    <button id="clearButton">Xóa nội dung hiển thị</button>
+</div>
+
+<script>
+    "use strict";
+
+    // ============================================================
+    // 1. LẤY CÁC PHẦN TỬ HTML
+    // ============================================================
+
+    const statusElement = document.getElementById("status");
+    const historyStatusElement = document.getElementById("historyStatus");
+    const messagesElement = document.getElementById("messages");
+
+    const connectButton = document.getElementById("connectButton");
+    const disconnectButton = document.getElementById("disconnectButton");
+    const roomButton = document.getElementById("roomButton");
+    const sendButton = document.getElementById("sendButton");
+    const clearButton = document.getElementById("clearButton");
+
+    const usernameInput = document.getElementById("username");
+    const passwordInput = document.getElementById("password");
+    const conversationIdInput = document.getElementById("conversationId");
+    const contentInput = document.getElementById("content");
+
+
+    // ============================================================
+    // 2. TRẠNG THÁI ỨNG DỤNG
+    // ============================================================
+
+    let client = null;
+    let jwtToken = null;
+    let currentUsername = null;
+    let roomSubscription = null;
+    let connected = false;
+    let currentConversationId = null;
+
+    let historyRequestId = 0;
+    let messagesById = new Map();
+    let systemLogs = [];
+
+    let oldestLoadedPage = 0;
+    const PAGE_SIZE = 20;
+
+    let isLoadingOlder = false;
+    let hasMoreHistory = true;
+
+
+    // ============================================================
+    // 3. HÀM TIỆN ÍCH
+    // ============================================================
+
+    function setStatus(message) {
+        statusElement.textContent = message;
+    }
+
+    function setHistoryStatus(message) {
+        historyStatusElement.textContent = message;
+    }
+
+    function getConversationId() {
+        const value = conversationIdInput.value.trim();
+
+        if (!/^[1-9]\d*$/.test(value)) {
+            throw new Error("Conversation ID phải là số nguyên dương.");
+        }
+
+        return value;
+    }
+
+    function log(message) {
+        systemLogs.push(message);
+
+        if (systemLogs.length > 50) {
+            systemLogs.shift();
+        }
+
+        renderMessages();
+    }
+
+    function normalizeMessage(message) {
+        return {
+            id: message.id,
+            conversationId: message.conversationId,
+            sender: message.sender ?? message.senderUsername ?? "Unknown",
+            content: message.content ?? "",
+            createdAt: message.createdAt ?? null,
+            editedAt: message.editedAt ?? null
+        };
+    }
+
+    function compareMessages(a, b) {
+        const timeA = Date.parse(a.createdAt);
+        const timeB = Date.parse(b.createdAt);
+
+        if (Number.isFinite(timeA) &&
+            Number.isFinite(timeB) &&
+            timeA !== timeB) {
+            return timeA - timeB;
+        }
+
+        return Number(a.id) - Number(b.id);
+    }
+
+    function isNearBottom() {
+        const distance =
+            messagesElement.scrollHeight -
+            messagesElement.scrollTop -
+            messagesElement.clientHeight;
+
+        return distance < 80;
+    }
+
+
+    // ============================================================
+    // 4. HIỂN THỊ TIN NHẮN VÀ NÚT SỬA/XÓA
+    // ============================================================
+
+    function renderMessages(options = {}) {
+        const {
+            scrollToBottom = false,
+            previousScrollHeight = null,
+            previousScrollTop = null
+        } = options;
+
+        const oldHeight =
+            previousScrollHeight ?? messagesElement.scrollHeight;
+        const oldTop =
+            previousScrollTop ?? messagesElement.scrollTop;
+
+        const messages = Array.from(messagesById.values())
+            .sort(compareMessages);
+
+        messagesElement.replaceChildren();
+
+        for (const message of messages) {
+            const line = document.createElement("div");
+            line.className = "message-line";
+
+            const content = document.createElement("div");
+            content.className = "message-content";
+
+            // textContent giúp hiển thị văn bản an toàn.
+            content.textContent =
+                message.sender + ": " + message.content;
+
+            line.appendChild(content);
+
+            const meta = document.createElement("div");
+            meta.className = "message-meta";
+
+            meta.textContent =
+                (message.createdAt ?? "Chưa có thời gian") +
+                (message.editedAt ? " (đã chỉnh sửa)" : "");
+
+            line.appendChild(meta);
+
+            // Chỉ hiện nút thao tác với tin nhắn của tài khoản hiện tại.
+            // Backend vẫn phải kiểm tra quyền sở hữu độc lập.
+            if (message.sender === currentUsername) {
+                const actions = document.createElement("div");
+                actions.className = "message-actions";
+
+                const editButton = document.createElement("button");
+                editButton.textContent = "Sửa";
+
+                editButton.onclick = () => {
+                    const newContent = prompt(
+                        "Nhập nội dung mới:",
+                        message.content
+                    );
+
+                    // Bấm Cancel thì không làm gì.
+                    if (newContent === null) {
+                        return;
+                    }
+
+                    if (!newContent.trim()) {
+                        alert("Nội dung tin nhắn không được để trống.");
+                        return;
+                    }
+
+                    if (newContent.length > 10000) {
+                        alert("Nội dung không được vượt quá 10000 ký tự.");
+                        return;
+                    }
+
+                    if (!connected || !client) {
+                        alert("WebSocket chưa kết nối.");
+                        return;
+                    }
+
+                    client.publish({
+                        destination: "/app/chat.edit",
+                        body: JSON.stringify({
+                            messageId: message.id,
+                            content: newContent
+                        })
+                    });
+
+                    log("Đã gửi yêu cầu sửa tin nhắn #" + message.id);
+                };
+
+                const deleteButton = document.createElement("button");
+                deleteButton.textContent = "Xóa";
+
+                deleteButton.onclick = () => {
+                    if (!confirm("Bạn có chắc muốn xóa tin nhắn này?")) {
+                        return;
+                    }
+
+                    if (!connected || !client) {
+                        alert("WebSocket chưa kết nối.");
+                        return;
+                    }
+
+                    client.publish({
+                        destination: "/app/chat.delete",
+                        body: JSON.stringify({
+                            messageId: message.id
+                        })
+                    });
+
+                    log("Đã gửi yêu cầu xóa tin nhắn #" + message.id);
+                };
+
+                actions.append(editButton, deleteButton);
+                line.appendChild(actions);
+            }
+
+            messagesElement.appendChild(line);
+        }
+
+        if (systemLogs.length > 0) {
+            const separator = document.createElement("hr");
+            messagesElement.appendChild(separator);
+
+            for (const entry of systemLogs) {
+                const line = document.createElement("div");
+                line.className = "system-log";
+                line.textContent = entry;
+                messagesElement.appendChild(line);
+            }
+        }
+
+        if (scrollToBottom) {
+            messagesElement.scrollTop = messagesElement.scrollHeight;
+        } else if (previousScrollHeight !== null) {
+            messagesElement.scrollTop =
+                oldTop + messagesElement.scrollHeight - oldHeight;
+        } else {
+            messagesElement.scrollTop = Math.min(
+                oldTop,
+                Math.max(
+                    0,
+                    messagesElement.scrollHeight - messagesElement.clientHeight
+                )
+            );
+        }
+    }
+
+
+    // ============================================================
+    // 5. XỬ LÝ SỰ KIỆN REALTIME
+    // ============================================================
+
+    // Xử lý cả tin nhắn mới, tin nhắn được sửa và tin nhắn bị xóa.
+    function handleRealtimeMessage(rawMessage) {
+        if (
+            currentConversationId === null ||
+            String(rawMessage.conversationId) !==
+            String(currentConversationId)
+        ) {
+            return;
+        }
+
+        const type = rawMessage.type;
+        const id = rawMessage.id;
+
+        if (id == null) {
+            log("Sự kiện WebSocket không có message ID.");
+            return;
+        }
+
+        const key = String(id);
+        const shouldScroll = isNearBottom();
+
+        switch (type) {
+            case "MESSAGE_CREATED": {
+                // Thêm tin nhắn mới. Map ngăn trùng ID.
+                const message = normalizeMessage(rawMessage);
+                messagesById.set(key, message);
+
+                log("Nhận tin nhắn mới #" + id);
+                break;
+            }
+
+            case "MESSAGE_UPDATED": {
+                // Cập nhật nội dung của tin nhắn đang hiển thị.
+                const oldMessage = messagesById.get(key);
+
+                if (oldMessage) {
+                    messagesById.set(key, {
+                        ...oldMessage,
+                        content: rawMessage.content,
+                        editedAt: rawMessage.editedAt
+                    });
+                } else {
+                    // Tin nhắn có thể chưa nằm trong trang lịch sử đã tải.
+                    messagesById.set(key, normalizeMessage(rawMessage));
+                }
+
+                log("Tin nhắn #" + id + " đã được sửa.");
+                break;
+            }
+
+            case "MESSAGE_DELETED": {
+                // Xóa khỏi giao diện, không cần tải lại trang.
+                messagesById.delete(key);
+
+                log("Tin nhắn #" + id + " đã bị xóa.");
+                break;
+            }
+
+            default: {
+                log("Sự kiện không xác định: " + String(type));
+                return;
+            }
+        }
+
+        renderMessages({
+            scrollToBottom: shouldScroll
+        });
+    }
+
+
+    // ============================================================
+    // 6. TẢI LỊCH SỬ TỪ REST API
+    // ============================================================
+
+    async function loadMessageHistory(
+        conversationId,
+        requestId,
+        page = 0,
+        loadOlder = false
+    ) {
+        if (loadOlder && (isLoadingOlder || !hasMoreHistory)) {
+            return;
+        }
+
+        if (loadOlder) {
+            isLoadingOlder = true;
+            setHistoryStatus("Đang tải tin nhắn cũ...");
+        } else {
+            setHistoryStatus("Đang tải lịch sử tin nhắn...");
+        }
+
+        try {
+            const previousScrollHeight = messagesElement.scrollHeight;
+            const previousScrollTop = messagesElement.scrollTop;
+
+            const response = await fetch(
+                `/api/messages/conversation/${conversationId}` +
+                `?page=${page}&size=${PAGE_SIZE}`,
+                {
+                    headers: {
+                        Authorization: "Bearer " + jwtToken
+                    }
+                }
+            );
+
+            const result = await response.json();
+
+            if (!response.ok) {
+                throw new Error(
+                    result.message || "Không thể tải lịch sử tin nhắn."
+                );
+            }
+
+            // Bỏ qua phản hồi thuộc phòng cũ.
+            if (
+                requestId !== historyRequestId ||
+                String(currentConversationId) !== String(conversationId)
+            ) {
+                return;
+            }
+
+            if (!Array.isArray(result.content)) {
+                throw new Error("Dữ liệu lịch sử không đúng định dạng.");
+            }
+
+            for (const rawMessage of result.content) {
+                const message = normalizeMessage(rawMessage);
+
+                if (
+                    message.id != null &&
+                    String(message.conversationId) === String(conversationId)
+                ) {
+                    // Không ghi đè nội dung mới hơn đã nhận từ WebSocket.
+                    if (!messagesById.has(String(message.id))) {
+                        messagesById.set(String(message.id), message);
+                    }
+                }
+            }
+
+            oldestLoadedPage = page;
+
+            hasMoreHistory = Number.isFinite(result.totalPages)
+                ? page + 1 < result.totalPages
+                : result.content.length === PAGE_SIZE;
+
+            if (loadOlder) {
+                renderMessages({
+                    previousScrollHeight,
+                    previousScrollTop
+                });
+
+                setHistoryStatus(
+                    hasMoreHistory
+                        ? "Đã tải thêm tin nhắn cũ."
+                        : "Đã tải hết lịch sử tin nhắn."
+                );
+            } else {
+                renderMessages({ scrollToBottom: true });
+
+                setHistoryStatus(
+                    hasMoreHistory
+                        ? "Cuộn lên đầu danh sách để tải tin cũ hơn."
+                        : "Đã tải hết lịch sử tin nhắn."
+                );
+
+                setStatus("Đã kết nối, đang ở phòng " + conversationId);
+            }
+
+        } catch (error) {
+            if (requestId === historyRequestId) {
+                setHistoryStatus("Không tải được lịch sử: " + error.message);
+            }
+        } finally {
+            if (requestId === historyRequestId) {
+                isLoadingOlder = false;
+            }
+        }
+    }
+
+
+    // ============================================================
+    // 7. TẢI THÊM TIN NHẮN CŨ KHI CUỘN LÊN
+    // ============================================================
+
+    messagesElement.addEventListener("scroll", () => {
+        if (
+            messagesElement.scrollTop <= 30 &&
+            connected &&
+            currentConversationId !== null &&
+            hasMoreHistory &&
+            !isLoadingOlder
+        ) {
+            loadMessageHistory(
+                currentConversationId,
+                historyRequestId,
+                oldestLoadedPage + 1,
+                true
+            );
+        }
+    });
+
+
+    // ============================================================
+    // 8. VÀO PHÒNG VÀ SUBSCRIBE
+    // ============================================================
+
+    async function subscribeRoom() {
+        if (!connected || !client) {
+            log("Hãy kết nối WebSocket trước.");
+            return;
+        }
+
+        let conversationId;
+
+        try {
+            conversationId = getConversationId();
+        } catch (error) {
+            log(error.message);
+            return;
+        }
+
+        const requestId = ++historyRequestId;
+
+        if (roomSubscription) {
+            roomSubscription.unsubscribe();
+            roomSubscription = null;
+        }
+
+        currentConversationId = conversationId;
+
+        messagesById.clear();
+        systemLogs = [];
+
+        oldestLoadedPage = 0;
+        isLoadingOlder = false;
+        hasMoreHistory = true;
+
+        setHistoryStatus("");
+        renderMessages();
+
+        const destination = "/topic/conversations/" + conversationId;
+
+        roomSubscription = client.subscribe(destination, (frame) => {
+            try {
+                const message = JSON.parse(frame.body);
+                handleRealtimeMessage(message);
+            } catch (error) {
+                log("Không đọc được dữ liệu WebSocket.");
+            }
+        });
+
+        log("Đã subscribe: " + destination);
+
+        // Subscribe trước, sau đó mới tải lịch sử.
+        await loadMessageHistory(
+            conversationId,
+            requestId,
+            0,
+            false
+        );
+    }
+
+
+    // ============================================================
+    // 9. ĐĂNG NHẬP VÀ KẾT NỐI WEBSOCKET
+    // ============================================================
+
+    connectButton.onclick = async () => {
+        const username = usernameInput.value.trim();
+        const password = passwordInput.value;
+
+        if (!username || !password) {
+            log("Hãy nhập username và password.");
+            return;
+        }
+
+        if (typeof StompJs === "undefined") {
+            log("Không tải được thư viện STOMP.");
+            return;
+        }
+
+        connectButton.disabled = true;
+        setStatus("Đang đăng nhập...");
+
+        try {
+            const response = await fetch("/api/auth/login", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({ username, password })
+            });
+
+            const result = await response.json();
+
+            if (!response.ok || !result.success || !result.token) {
+                throw new Error(result.message || "Đăng nhập thất bại.");
+            }
+
+            jwtToken = result.token;
+            currentUsername = result.username;
+
+            client = new StompJs.Client({
+                brokerURL: "ws://" + window.location.host + "/ws",
+
+                connectHeaders: {
+                    Authorization: "Bearer " + jwtToken
+                },
+
+                reconnectDelay: 0,
+
+                debug: (message) => console.log("[STOMP]", message),
+
+                onConnect: () => {
+                    connected = true;
+
+                    disconnectButton.disabled = false;
+                    roomButton.disabled = false;
+                    sendButton.disabled = false;
+
+                    passwordInput.value = "";
+
+                    setStatus(
+                        "Đã kết nối với tài khoản: " + currentUsername
+                    );
+
+                    log("WebSocket đã kết nối.");
+
+                    if (conversationIdInput.value.trim()) {
+                        subscribeRoom();
+                    }
+                },
+
+                onStompError: (frame) => {
+                    log(
+                        "Lỗi STOMP: " +
+                        (frame.headers.message || "Không rõ")
+                    );
+                },
+
+                onWebSocketError: () => {
+                    log("Lỗi WebSocket. Kiểm tra Console và server.");
+                },
+
+                onWebSocketClose: () => {
+                    connected = false;
+                    roomSubscription = null;
+                    currentConversationId = null;
+
+                    historyRequestId++;
+
+                    isLoadingOlder = false;
+                    hasMoreHistory = false;
+                    oldestLoadedPage = 0;
+
+                    disconnectButton.disabled = true;
+                    roomButton.disabled = true;
+                    sendButton.disabled = true;
+                    connectButton.disabled = false;
+
+                    setHistoryStatus("");
+                    setStatus("WebSocket đã ngắt kết nối.");
+                }
+            });
+
+            setStatus("Đăng nhập thành công, đang kết nối...");
+            client.activate();
+
+        } catch (error) {
+            jwtToken = null;
+            currentUsername = null;
+
+            setStatus("Không thể đăng nhập hoặc kết nối.");
+            log("Lỗi: " + error.message);
+
+            connectButton.disabled = false;
+        }
+    };
+
+
+    // ============================================================
+    // 10. VÀO PHÒNG CHAT
+    // ============================================================
+
+    roomButton.onclick = () => {
+        subscribeRoom();
+    };
+
+
+    // ============================================================
+    // 11. GỬI TIN NHẮN
+    // ============================================================
+
+    sendButton.onclick = () => {
+        if (!connected || !client) {
+            log("WebSocket chưa kết nối.");
+            return;
+        }
+
+        let conversationId;
+
+        try {
+            conversationId = Number(getConversationId());
+        } catch (error) {
+            log(error.message);
+            return;
+        }
+
+        const content = contentInput.value.trim();
+
+        if (!content) {
+            log("Nội dung tin nhắn không được để trống.");
+            return;
+        }
+
+        if (
+            !roomSubscription ||
+            String(conversationId) !== String(currentConversationId)
+        ) {
+            log("Hãy vào đúng phòng chat trước.");
+            return;
+        }
+
+        client.publish({
+            destination: "/app/chat.send",
+            body: JSON.stringify({
+                conversationId,
+                content
+            })
+        });
+
+        contentInput.value = "";
+    };
+
+    contentInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && !event.shiftKey) {
+            event.preventDefault();
+
+            if (!sendButton.disabled) {
+                sendButton.click();
+            }
+        }
+    });
+
+
+    // ============================================================
+    // 12. NGẮT KẾT NỐI
+    // ============================================================
+
+    disconnectButton.onclick = async () => {
+        const activeClient = client;
+
+        historyRequestId++;
+
+        if (roomSubscription) {
+            roomSubscription.unsubscribe();
+        }
+
+        roomSubscription = null;
+        currentConversationId = null;
+
+        connected = false;
+        jwtToken = null;
+        currentUsername = null;
+        client = null;
+
+        messagesById.clear();
+        systemLogs = [];
+
+        oldestLoadedPage = 0;
+        isLoadingOlder = false;
+        hasMoreHistory = false;
+
+        renderMessages();
+        setHistoryStatus("");
+
+        connectButton.disabled = false;
+        disconnectButton.disabled = true;
+        roomButton.disabled = true;
+        sendButton.disabled = true;
+
+        if (activeClient) {
+            try {
+                await activeClient.deactivate();
+            } catch (error) {
+                console.error("Lỗi khi ngắt kết nối:", error);
+            }
+        }
+
+        setStatus("Đã ngắt kết nối.");
+    };
+
+
+    // ============================================================
+    // 13. XÓA NỘI DUNG HIỂN THỊ
+    // ============================================================
+
+    // Chỉ xóa dữ liệu đang hiển thị trong trang, không xóa database.
+    clearButton.onclick = () => {
+        historyRequestId++;
+
+        messagesById.clear();
+        systemLogs = [];
+
+        oldestLoadedPage = 0;
+        isLoadingOlder = false;
+        hasMoreHistory = false;
+
+        setHistoryStatus(
+            "Đã xóa nội dung hiển thị. Vào lại phòng để tải lịch sử."
+        );
+
+        renderMessages();
+        setStatus("Đã xóa nội dung hiển thị.");
+    };
+</script>
+</body>
+</html>

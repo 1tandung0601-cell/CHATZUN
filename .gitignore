@@ -1,0 +1,15 @@
+**/target/
+**/node_modules/
+**/dist/
+**/.vite/
+.idea/
+.vscode/
+*.iml
+.env
+.env.*
+!.env.example
+!.env.local.example
+*.log
+logs/
+Thumbs.db
+.DS_Store
